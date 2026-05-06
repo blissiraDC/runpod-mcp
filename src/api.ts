@@ -264,7 +264,7 @@ export class RunPodClient {
     };
     if (opts.networkVolumeId) input.networkVolumeId = opts.networkVolumeId;
     if (opts.dockerArgs) input.dockerArgs = opts.dockerArgs;
-    if (opts.dataCenterIds?.length) input.dataCenterIds = opts.dataCenterIds;
+    if (opts.dataCenterIds?.length) input.dataCenterId = opts.dataCenterIds[0]; // RunPod GraphQL changed to singular
 
     const data = await this.graphqlRequest<{ podRentInterruptable: { id: string } }>(query, { input }, { timeoutMs: 60_000 });
     return data.podRentInterruptable;
