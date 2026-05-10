@@ -2,11 +2,11 @@ node_modules/
 *.tsbuildinfo
 
 # Only keep the esbuild bundle (dist/runpod-mcp.mjs)
-# Ignore tsc intermediate outputs
-dist/*.js
-dist/*.js.map
-dist/*.d.ts
-dist/*.d.ts.map
+# Ignore tsc intermediate outputs (incl. nested __tests__/)
+dist/**/*.js
+dist/**/*.js.map
+dist/**/*.d.ts
+dist/**/*.d.ts.map
 
 # OMC Experiment Workflow
 outputs/**/*.csv
@@ -15,3 +15,9 @@ outputs/**/*.pkl
 outputs/**/*.html
 !outputs/MANIFEST.yaml
 .omc-config.sh
+
+# Local OMC state (sessions, plans, scratch) — never tracked
+.omc/
+
+# Local progress / scratch notes
+progress.txt
