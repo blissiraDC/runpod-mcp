@@ -10,6 +10,7 @@ import type { Pod } from "./types.js";
 import { safeTool, text, errorResult } from "./tool-helpers.js";
 import type { ToolResult } from "./tool-helpers.js";
 import { parseNvidiaSmiOutput, calcSuggestedBatchSize, isOverprovisioned, injectPytorchEnv, summarizeTrend, getStockStatus, isInStock, getSpotPrice, getOnDemandPrice } from "./gpu-utils.js";
+import { classifyTrainingSmoke, planMonitoringCadence, renderMonitoringCadenceSection } from "./monitoring-utils.js";
 import { filterStalePods, selectGpuCandidates, deletePodWithStop, DEFAULT_DC_PRIORITY, formatDcGpuFailureMatrix, buildPodMetadataPath, toYaml, buildPodMetadataStub, parseDuBytes, parseDfAvailBytes, checkFreeSpace, checkSizeMatch, looksLikeSetupCommand, estimatePodCost } from "./pod-ops.js";
 
 const COST_GATE_GPU_COUNT = 2;       // gpuCount >= this triggers gate
@@ -1552,6 +1553,13 @@ server.tool(
     lines.push(`[ ] 훈련 완료 후 (NV 있음): \`rsync -a /root/outputs/ /workspace/outputs/ && echo RSYNC_OK\` → RSYNC_OK 확인 → \`delete_pod(artifactsSavedConfirmed: true)\``);
     lines.push(`[ ] 훈련 완료 후 (NV 없음): \`download_files\` → \`delete_pod(artifactsSavedConfirmed: true)\``);
 
+    // ── Monitoring Cadence Plan (mandatory; data-driven instead of fixed-interval polling) ──
+    lines.push(...renderMonitoringCadenceSection({
+      expectedHours: args.expectedHours ?? null,
+      gpuPrice,
+      partialMode,
+    }));
+
     lines.push(``);
     // Seed parallelization section
     if (args.seedCount > 1) {
@@ -1756,8 +1764,10 @@ server.tool(
     trainDataPath: z.string().optional().describe("Absolute path on pod where the training script READS data from (e.g. '/workspace/dataset' or '/root/data'). REQUIRED for GPU pods with NV attached unless allowNvStreaming:true. NV random read is ~18x slower than rootfs (43 vs 775 files/sec). Verifies data has been copied from NV to rootfs."),
     expectedRandomAccessGb: z.number().optional().describe("Size (GB) of dataset that needs random access during training. Used to verify rootfs has enough free space. rootfs CANNOT be expanded after pod creation — must be sized at creation time via containerDiskInGb."),
     allowNvStreaming: z.boolean().default(false).describe("Opt-out: skip the NV→rootfs migration HALT. Only set true if training does PURELY sequential reads (rare for ML; image/molecule/text shuffled training all need random access)."),
+    trainingSmokeCmd: z.string().optional().describe("Optional shell command (run from /workspace) that exercises the actual training entry point for ~30s — e.g. 'python3 train.py --smoke-test' or 'python3 -c \"from src.train import main; main(smoke=True)\"'. Catches NotImplementedError/skeleton scripts BEFORE billing starts. HALT on NotImplementedError|ImportError|SyntaxError|ModuleNotFoundError|AttributeError. A 30s timeout (exit 124) without those patterns is treated as PASS (training started running). Strongly recommended for any pod whose script you have not previously executed end-to-end."),
+    trainingEntryModule: z.string().optional().describe("Optional Python module path (e.g. 'src.train' or 'experiments.e215.run') used as a fallback smoke when trainingSmokeCmd is not provided. Runs `python3 -c 'import <mod>'` from /workspace and HALTs on top-level NotImplementedError/ImportError/SyntaxError. Cheaper than trainingSmokeCmd but only catches import-time failures, not function-body skeletons."),
   },
-  safeTool(async ({ podId, requirementsPath, requiredFiles, requiredTools, importSmokes, minDiskFreeGb, strict, trainDataPath, expectedRandomAccessGb, allowNvStreaming }) => {
+  safeTool(async ({ podId, requirementsPath, requiredFiles, requiredTools, importSmokes, minDiskFreeGb, strict, trainDataPath, expectedRandomAccessGb, allowNvStreaming, trainingSmokeCmd, trainingEntryModule }) => {
     const c = requireClient();
     const pod = await c.getPod(podId);
     if (!pod) return text(`❌ Pod ${podId} not found.`);
@@ -2024,6 +2034,59 @@ server.tool(
       }
     }
 
+    // 6. Training smoke — HALT on skeleton scripts (NotImplementedError, ImportError, SyntaxError, ModuleNotFoundError, AttributeError)
+    if (trainingSmokeCmd || trainingEntryModule) {
+      let sshCmd: string;
+      let smokeLabel: string;
+      if (trainingSmokeCmd) {
+        // Defense-in-depth: strip newlines/CRs (base64 wrap below blocks injection regardless)
+        const safeCmd = trainingSmokeCmd.replace(/[\n\r]/g, " ");
+        const wrapped = `cd /workspace && timeout 30 ${safeCmd} 2>&1; echo __SMOKE_EXIT__$?`;
+        const wrappedB64 = Buffer.from(wrapped).toString("base64");
+        sshCmd = `bash -c 'echo ${wrappedB64} | base64 -d | bash'`;
+        smokeLabel = "Training smoke (cmd)";
+      } else {
+        const safeMod = (trainingEntryModule ?? "").replace(/[^\w.]/g, "");
+        const py = `import importlib; importlib.import_module('${safeMod}'); print('__SMOKE_IMPORT_OK__')`;
+        const pyB64 = Buffer.from(py).toString("base64");
+        const wrapped = `cd /workspace && timeout 30 bash -c 'echo ${pyB64} | base64 -d | python3' 2>&1; echo __SMOKE_EXIT__$?`;
+        const wrappedB64 = Buffer.from(wrapped).toString("base64");
+        sshCmd = `bash -c 'echo ${wrappedB64} | base64 -d | bash'`;
+        smokeLabel = `Training smoke (import ${safeMod})`;
+      }
+      const smokeResult = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", sshCmd], { timeout: 45_000 });
+      const stdout = smokeResult.stdout ?? "";
+      const stderr = smokeResult.stderr ?? "";
+      const verdict = classifyTrainingSmoke(stdout, stderr, smokeResult.status);
+      if (verdict.kind === "skeleton") {
+        results.push({
+          label: smokeLabel,
+          status: "❌",
+          detail:
+            `HALT — training entry not runnable: ${verdict.match}. ` +
+            `Implement training logic before launching the pod (idle billing risk). ` +
+            `Excerpt: ${verdict.excerpt.substring(0, 200)}`,
+        });
+        hasFail = true;
+      } else if (verdict.kind === "ok") {
+        results.push({ label: smokeLabel, status: "✅", detail: verdict.reason });
+      } else if (verdict.kind === "timeout_no_ssh") {
+        results.push({
+          label: smokeLabel,
+          status: "⚠️",
+          detail: "SSH itself timed out (45s) — pod may be cold-starting. Re-run run_preflight.",
+        });
+        hasWarn = true;
+      } else {
+        results.push({
+          label: smokeLabel,
+          status: "⚠️",
+          detail: `Smoke exited with unexpected status: ${verdict.reason}`,
+        });
+        hasWarn = true;
+      }
+    }
+
     const lines: string[] = [`## Pre-flight Results — ${podId}`];
     for (const r of results) {
       lines.push(`${r.status} ${r.label}: ${r.detail}`);
@@ -2037,6 +2100,81 @@ server.tool(
 
     const overallFail = hasFail || (strict && hasWarn);
     lines.push(`RESULT: ${overallFail ? "❌ FAIL" : "✅ PASS"} (${passed}/${totalChecks} checks passed${warned > 0 ? `, ${warned} warning(s)` : ""}, ${failed} failure(s))`);
+    return text(lines.join("\n"));
+  })
+);
+
+// ── plan_monitoring_cadence ──
+server.tool(
+  "plan_monitoring_cadence",
+  "Compute a data-driven monitoring schedule from MEASURED throughput. Call AFTER training has launched and you have read the first epoch/step time from the pod log. " +
+  "Returns: etaMinutes, handoffRequired (true when ETA exceeds 80% of remaining session window), checkSchedule (50/80/100% of ETA when supervising), cost estimates (cache miss × N vs fresh-session handoff), and an auto-generated MONITORING_HANDOFF.md template when handoff is required. " +
+  "This is the ONLY sanctioned way to set a check cadence — fixed-interval polling (e.g. every 30 min) is forbidden because cache-miss token cost compounds linearly with check count.",
+  {
+    podId: z.string().describe("Pod ID being monitored"),
+    firstEpochSeconds: z.number().positive().describe("Measured wall time of one epoch (or one step, if epoch is too coarse). Read from /workspace/log via execute_ssh_command. Must be measured AFTER cache-warm verification (Step A in plan_gpu_job's Monitoring Cadence Plan)."),
+    totalEpochs: z.number().positive().describe("Total epochs (or total steps, must match unit of firstEpochSeconds)"),
+    sessionRemainingMinutes: z.number().positive().describe("Estimated minutes remaining in this conversation before context limits / user end-of-day. If unsure, use 90 (a typical productive session window)."),
+    runpodCostPerHr: z.number().nonnegative().describe("Pod cost per hour in USD (from create_pod_auto response or list_gpu_types)"),
+    cachePerCheckUsd: z.number().nonnegative().default(0.6).describe("Estimated token cost of one supervised check (default $0.60 = 200k context × $3/MTok cache miss). Scale up for larger conversations."),
+  },
+  safeTool(async ({ podId, firstEpochSeconds, totalEpochs, sessionRemainingMinutes, runpodCostPerHr, cachePerCheckUsd }) => {
+    const result = planMonitoringCadence({
+      podId,
+      firstEpochSeconds,
+      totalEpochs,
+      sessionRemainingMinutes,
+      runpodCostPerHr,
+      cachePerCheckUsd,
+    });
+
+    const lines: string[] = [];
+    lines.push(`## Monitoring Cadence — ${podId}`);
+    lines.push(``);
+    lines.push(`**ETA**: ${result.etaMinutes} min (\`${result.etaIso}\`)`);
+    lines.push(`**Recommendation**: ${result.recommendation === "handoff" ? "🔁 HANDOFF (new session at ETA)" : "👁  SUPERVISE (this session)"}`);
+    if (result.handoffReason) {
+      lines.push(`**Why**: ${result.handoffReason}`);
+    }
+    lines.push(``);
+    lines.push(`### Cost comparison`);
+    lines.push(`| Path | Token cost | RunPod cost | Total |`);
+    lines.push(`|------|-----------|-------------|-------|`);
+    const supSimulated = Math.max(3, Math.ceil(result.etaMinutes / 30)) * cachePerCheckUsd;
+    lines.push(`| Supervise (this session, ${result.handoffRequired ? "naive 30-min polling" : `${result.checkSchedule.length} ETA-based checks`}) | $${(result.handoffRequired ? supSimulated : result.estimatedSupervisedTokenCost).toFixed(2)} | $${result.estimatedRunpodCost.toFixed(2)} | $${((result.handoffRequired ? supSimulated : result.estimatedSupervisedTokenCost) + result.estimatedRunpodCost).toFixed(2)} |`);
+    lines.push(`| Handoff (fresh session at ETA) | $${result.estimatedHandoffTokenCost.toFixed(2)} | $${result.estimatedRunpodCost.toFixed(2)} | $${(result.estimatedHandoffTokenCost + result.estimatedRunpodCost).toFixed(2)} |`);
+    lines.push(``);
+    lines.push(`### Check schedule`);
+    if (result.checkSchedule.length === 0) {
+      lines.push(`(none — handoff replaces all checks)`);
+    } else {
+      lines.push(`| At (min) | At (UTC) | Fraction | Action |`);
+      lines.push(`|---------|----------|----------|--------|`);
+      for (const c of result.checkSchedule) {
+        lines.push(`| +${c.atMinutes} | ${c.atIso} | ${(c.fraction * 100).toFixed(0)}% | ${c.action} |`);
+      }
+    }
+    lines.push(``);
+    if (result.handoffTemplate) {
+      lines.push(`### MONITORING_HANDOFF.md template`);
+      lines.push(`Save the block below to your project (e.g. \`./MONITORING_HANDOFF.md\`), then end this session. Open a fresh session at the ETA and feed the file as input.`);
+      lines.push(``);
+      lines.push("```markdown");
+      lines.push(result.handoffTemplate);
+      lines.push("```");
+    } else {
+      lines.push(`### Wakeup pacing`);
+      const next = result.checkSchedule[0];
+      if (next) {
+        if (next.atMinutes < 4) {
+          lines.push(`Next check in ${next.atMinutes}min — wait inline (cache stays warm at <270s).`);
+        } else if (next.atMinutes <= 60) {
+          lines.push(`Next check in ${next.atMinutes}min — schedule a wakeup, do other work in the meantime.`);
+        } else {
+          lines.push(`Next check in ${next.atMinutes}min — single cache miss is acceptable; otherwise switch to handoff.`);
+        }
+      }
+    }
     return text(lines.join("\n"));
   })
 );

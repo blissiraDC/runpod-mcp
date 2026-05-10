@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.6] - 2026-05-06
+
+### Added
+- `plan_monitoring_cadence` — new tool. Takes `firstEpochSeconds`, `totalEpochs`, `sessionRemainingMinutes`, `runpodCostPerHr` measured AFTER training launch and returns `etaMinutes`, `handoffRequired`, `checkSchedule`, cost estimates (supervise vs handoff), and an auto-generated `MONITORING_HANDOFF.md` template (pod ID + ETA UTC + RSYNC_OK protocol). Replaces ad-hoc fixed-interval polling: cache-miss token cost is now decided by a deterministic function instead of LLM judgment.
+- `run_preflight`: `trainingSmokeCmd` + `trainingEntryModule` parameters. Runs a 30s SSH smoke command (or import) before launch and HALTs on `NotImplementedError`, `ImportError`, `ModuleNotFoundError`, `SyntaxError`, or `AttributeError ... has no attribute`. Catches skeleton scripts before billing starts (Phase E sevent-figure incident class).
+- `plan_gpu_job`: mandatory `### Monitoring Cadence Plan (필수 — 6단계)` section. Always emitted, with explicit Step A (cache-warm verification), Step B (throughput measurement), Step C (`plan_monitoring_cadence` call), Step D (session-handoff branching), Step E (wakeup pacing rules), Step F (artifact preservation). Adds a `Session Span 경고` block when `expectedHours > 2`.
+- `src/monitoring-utils.ts` — pure module exporting `classifyTrainingSmoke`, `planMonitoringCadence`, `renderMonitoringCadenceSection`, plus the `SmokeVerdict` / `CadenceInput` / `CadenceCheck` / `CadenceResult` / `CadenceSectionInput` types. All decision logic is unit-testable with no SSH/IO.
+- 35 new test cases in `monitoring-utils.test.ts` covering skeleton-pattern detection, ETA computation, handoff thresholds (incl. short-session edge < 12 min → empty schedule), and `renderMonitoringCadenceSection` partialMode short-circuit.
+
+### Changed
+- `CLAUDE.md` GPU Optimization Workflow: replaced free-form "Re-check every 5-10 min during long runs" with the cadence-driven Step A/B/C protocol that forces `plan_monitoring_cadence` after first epoch is measured. Also updated the post-create workflow to require `trainingSmokeCmd` for any first-time script.
+
+### Fixed
+- `planMonitoringCadence`: short-session edge — when `sessionRemainingMinutes < 12` and handoff is required, the early sanity-check is now omitted (empty `checkSchedule`) instead of being scheduled past session end. For longer sessions the early check is clamped to `sessionRemainingMinutes - 2` so it always lands inside the session window.
+- `plan_gpu_job` + `renderMonitoringCadenceSection`: when no GPU meets the VRAM requirement (PARTIAL PLAN), the cadence section now short-circuits with a "rerun after GPU is determined" notice instead of printing a misleading `runpodCostPerHr=0.00` literal.
+
 ## [0.5.0] - 2026-04-16
 
 ### Added

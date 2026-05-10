@@ -58,14 +58,25 @@ plan_gpu_job(randomAccessTrainingGb=N) → containerDiskInGb 권장값 출력
 1. `create_pod_auto` → `wait_for_pod` → `upload_files` (NV로)
    → `execute_ssh_command` (setup: apt install, pip install 등)
    → `execute_ssh_command` (`mkdir -p /root/data && cp -r --reflink=auto /workspace/<dataset> /root/data/`) — NV→rootfs 복사 (랜덤 액세스 훈련 시 필수)
-   → **`run_preflight(trainDataPath="/root/data/<dataset>", expectedRandomAccessGb=N)`** ← CUDA + NV→rootfs 위치 + 사이즈 검증 (필수)
+   → **`run_preflight(trainDataPath="/root/data/<dataset>", expectedRandomAccessGb=N, trainingSmokeCmd="python3 train.py --smoke-test")`** ← CUDA + NV→rootfs + 사이즈 + **훈련 스크립트 실행 가능성** 검증 (필수)
+     - `trainingSmokeCmd`는 처음 실행하는 스크립트(또는 e215/e219처럼 새로 작성된 것)에 **반드시** 포함. NotImplementedError/skeleton script을 launch 전에 잡음.
+     - smokeCmd가 어려우면 fallback: `trainingEntryModule="src.train"` (import-time 오류만 잡음)
    → `execute_ssh_command` (training launch — 스크립트가 `/root/data/<dataset>` 읽도록 설정)
-2. Training launch 직후 **`gpu_sample_burst`** 호출 (필수)
+2. **Step A: cache-warm 검증 (T+0~5min) — `gpu_sample_burst`** 호출 (필수)
    - OMC 환경: `ScheduleWakeup(delaySeconds=120)` 설정 → wakeup 시 `gpu_sample_burst` 호출
    - 직접(OMC 없는 환경): `execute_ssh_command("sleep 120")` 완료 후 `gpu_sample_burst` 호출
-   → `CONSISTENTLY_IDLE` → 즉시 중단 + 로그 확인 (CPU fallback 또는 NV 스트리밍 의심)
-   → `STABLE_OPTIMAL` / `IMPROVING` → `watch_running_pods`로 모니터링 인계
-3. 훈련 완료 후 **아티팩트 보존** (필수):
+   → `CONSISTENTLY_IDLE` → 즉시 중단 + 로그 확인 (CPU fallback / NV 스트리밍 / NotImplementedError 잔여 의심)
+   → `STABLE_OPTIMAL` / `IMPROVING` → Step B로
+3. **Step B: 처리량 측정 (T+5~10min)** — 1 epoch (또는 1 step) 실측 시간 확보
+   - `execute_ssh_command(... "tail -100 /workspace/log | grep -E 'epoch|step|it/s' | tail -5")`
+   - 실측 X초 / epoch, 총 N epoch 수집
+4. **Step C: `plan_monitoring_cadence` 호출 (T+10min, 필수)** — 임의 polling 금지
+   - `plan_monitoring_cadence(podId, firstEpochSeconds=X, totalEpochs=N, sessionRemainingMinutes=<남은시간>, runpodCostPerHr=<podPrice>)`
+   - 출력의 `recommendation`이 `"handoff"`면 handoffTemplate를 `MONITORING_HANDOFF.md`로 저장 후 새 세션에서 ETA 시점에 재진입
+   - `"supervise"`면 출력의 `checkSchedule`을 그대로 따라 50/80/100% 시점에만 체크
+   - **30분 fixed polling 금지** (cache miss × N = $0.6/회 누적, 흔히 RunPod 비용을 초과)
+   - 대신 `watch_running_pods`로 백그라운드 헬스체크 인계 가능 (token-free)
+5. 훈련 완료 후 **아티팩트 보존** (필수):
    - **NV 있는 경우**: `execute_ssh_command("rsync -a /root/outputs/ /workspace/outputs/ && echo RSYNC_OK")`
      → 출력에서 `RSYNC_OK` 확인 필수 (partial transfer 방지) → `delete_pod(artifactsSavedConfirmed: true)`
    - **NV 없는 경우**: `download_files(remotePath="/workspace", localPath="./outputs/")` → `delete_pod(artifactsSavedConfirmed: true)`
@@ -83,9 +94,11 @@ Claude는 사용자 명시 없이 `artifactsSavedConfirmed: true` 자동 설정 
 NV 없는 팟에서 `delete_pod` 호출 전 반드시 download 완료를 사용자에게 확인할 것.
 
 **예외 (run_preflight allowNvStreaming:true):** 훈련이 순수 sequential read만 한다면 (드물다 — 대부분의 ML은 random shuffle) NV 직접 사용 가능. 이 경우만 opt-out.
-3. If underutilized, call `gpu_health_check` with `perSampleMb` for batch size recommendation
-4. Call `gpu_cost_compare` if GPU is underutilized to find cheaper alternatives
-5. **Re-call `gpu_health_check` every 5-10 min during long training runs** to detect degradation or idle drift
+
+**Step B/C 보조 진단 (선택, supervise 경로에서):**
+- Underutilized로 판정되면 `gpu_health_check(perSampleMb=...)` 호출 → batch size 권장값 확인
+- `gpu_cost_compare`로 더 저렴한 GPU 대안 탐색 (NV 미바운드일 때)
+- ※ Step C가 산출한 `checkSchedule` 외 추가 polling은 금지. 이 진단은 cadence가 권하는 체크 시각 안에서만 수행.
 
 ### Critical Rules
 - **NEVER use spot instances** — always use on-demand (`spot: false`, which is the default). Spot pods can be preempted at any time and there is NO automatic backup or checkpoint-on-preemption mechanism in this MCP server. If the user explicitly insists on spot, warn them that data on container disk will be lost on preemption and require checkpointing to a network volume.
@@ -140,8 +153,10 @@ User requests GPU work
 │   └─ Data loader bottleneck. Recommend:
 │       num_workers=<cpu_count-1>, pin_memory=True, prefetch_factor=2
 │
-└─ Re-check every 5-10 min during long runs
-    └─ If IDLE for 2+ consecutive checks → warn user about cost waste
+└─ Cadence after first burst: ALWAYS use `plan_monitoring_cadence` output
+    ├─ Run after Step B (~T+10min) once first epoch/step time is measured
+    ├─ Follow `checkSchedule` exactly (50/80/100% of measured ETA, not fixed 5-10 min)
+    └─ If `recommendation: "handoff"` → save `MONITORING_HANDOFF.md`, end session, resume at ETA
 ```
 
 ### Staging Pod Pattern
@@ -273,3 +288,7 @@ create_pod_auto                              ← response includes Pod Metadata 
 - **MODERATE** (60-74%): Room for improvement
 - **OPTIMAL** (75-89%): Good utilization
 - **NEAR_OOM** (>=90%): Risk of crash — reduce batch size or enable gradient checkpointing
+
+
+## Mode marker (added by global setup)
+@/home/kyuwon/.claude/templates/code-CLAUDE.md
