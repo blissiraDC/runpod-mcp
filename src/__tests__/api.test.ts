@@ -322,6 +322,7 @@ describe("waitForPod", () => {
     };
     vi.spyOn(client, "getPod").mockResolvedValue(readyPod as any);
     vi.spyOn(client as any, "tcpProbe").mockResolvedValue(true);
+    vi.spyOn(client as any, "sshAuthProbe").mockResolvedValue("ok");
 
     const pod = await client.waitForPod("p1", 5000, 100);
     expect(pod.id).toBe("p1");
@@ -343,6 +344,28 @@ describe("waitForPod", () => {
     await expect(client.waitForPod("p1", 300, 100)).rejects.toThrow("did not become ready");
   });
 
+  it("retries when TCP is ready but authorized_keys not yet injected (auth_fail race)", async () => {
+    // Regression: authorized_keys injected after SSH daemon starts — TCP open ≠ auth ready.
+    // waitForPod must keep retrying when sshAuthProbe returns auth_fail.
+    const client = makeClient();
+    const readyPod = {
+      id: "p1", name: "test", desiredStatus: "RUNNING",
+      publicIp: "1.2.3.4", portMappings: { "22": 10022 },
+    };
+    vi.spyOn(client, "getPod").mockResolvedValue(readyPod as any);
+    vi.spyOn(client as any, "tcpProbe").mockResolvedValue(true);
+
+    let authCallCount = 0;
+    vi.spyOn(client as any, "sshAuthProbe").mockImplementation(async () => {
+      authCallCount++;
+      return authCallCount >= 3 ? "ok" : "auth_fail";
+    });
+
+    const pod = await client.waitForPod("p1", 5000, 10);
+    expect(pod.id).toBe("p1");
+    expect(authCallCount).toBeGreaterThanOrEqual(3);
+  });
+
   it("calls onProgress callback with status updates", async () => {
     const client = makeClient();
     const pendingPod = { id: "p1", name: "test", desiredStatus: "CREATED" };
@@ -357,6 +380,7 @@ describe("waitForPod", () => {
       return (callCount >= 2 ? readyPod : pendingPod) as any;
     });
     vi.spyOn(client as any, "tcpProbe").mockResolvedValue(true);
+    vi.spyOn(client as any, "sshAuthProbe").mockResolvedValue("ok");
 
     const messages: string[] = [];
     await client.waitForPod("p1", 5000, 50, (msg) => messages.push(msg));

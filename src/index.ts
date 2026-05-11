@@ -815,9 +815,17 @@ server.tool(
     const sshArgs = c.getSshArgs(pod);
     if (!sshArgs) return text("Pod is not ready for SSH.");
 
-    const result = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", command], {
+    // Retry on "Permission denied" — RunPod may inject authorized_keys slightly
+    // after the SSH daemon starts (race window not caught by wait_for_pod TCP probe).
+    let result = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", command], {
       timeout: timeoutSeconds * 1000,
     });
+    for (let i = 0; i < 3 && result.status === 255 && result.stderr.includes("Permission denied"); i++) {
+      await new Promise((r) => setTimeout(r, 5_000));
+      result = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", command], {
+        timeout: timeoutSeconds * 1000,
+      });
+    }
 
     if (result.error) return text(`SSH error: ${result.error.message}`);
     if (result.status !== 0) {

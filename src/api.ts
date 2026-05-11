@@ -381,7 +381,7 @@ export class RunPodClient {
     return ["rsync", ...rsyncFlags.split(" "), "-e", sshArg, remote, localPath];
   }
 
-  // ── Wait for Pod (with TCP probe) ──
+  // ── Wait for Pod (with TCP probe + SSH auth probe) ──
 
   private tcpProbe(host: string, port: number, timeoutMs: number = 5000): Promise<boolean> {
     return new Promise((resolve) => {
@@ -401,6 +401,26 @@ export class RunPodClient {
     });
   }
 
+  // Probe whether SSH key auth is working (authorized_keys injected by RunPod).
+  // TCP open ≠ auth ready: RunPod injects keys after the SSH daemon starts,
+  // causing a race window where connections get "Permission denied (publickey)".
+  private async sshAuthProbe(pod: Pod): Promise<"ok" | "auth_fail"> {
+    if (!pod.publicIp || !pod.portMappings?.["22"]) return "auth_fail";
+    const args = [
+      "-o", "StrictHostKeyChecking=no",
+      "-o", "ConnectTimeout=5",
+      "-o", "BatchMode=yes",
+      "-p", String(pod.portMappings["22"]),
+    ];
+    if (this.config.sshKeyPath) args.push("-i", this.config.sshKeyPath);
+    args.push(`root@${pod.publicIp}`, "--", "true");
+    const result = await spawnAsync("ssh", args, { timeout: 8_000 });
+    if (result.status === 0) return "ok";
+    if (result.status === 255 && result.stderr.includes("Permission denied")) return "auth_fail";
+    // Other errors (connection reset, etc.) — don't block forever, let caller surface the real error.
+    return "ok";
+  }
+
   async waitForPod(
     podId: string,
     timeoutMs: number = 300_000,
@@ -413,9 +433,14 @@ export class RunPodClient {
       const elapsed = Math.round((Date.now() - start) / 1000);
       if (pod.desiredStatus === "RUNNING" && pod.publicIp && pod.portMappings?.["22"]) {
         onProgress?.(`[${elapsed}s] Pod RUNNING, probing SSH at ${pod.publicIp}:${pod.portMappings["22"]}...`);
-        const sshReady = await this.tcpProbe(pod.publicIp, pod.portMappings["22"]);
-        if (sshReady) return pod;
-        onProgress?.(`[${elapsed}s] SSH not ready yet, retrying...`);
+        const tcpReady = await this.tcpProbe(pod.publicIp, pod.portMappings["22"]);
+        if (tcpReady) {
+          const authResult = await this.sshAuthProbe(pod);
+          if (authResult === "ok") return pod;
+          onProgress?.(`[${elapsed}s] SSH port open but authorized_keys not injected yet, retrying...`);
+        } else {
+          onProgress?.(`[${elapsed}s] SSH not ready yet, retrying...`);
+        }
       } else if (pod.desiredStatus === "EXITED" || pod.desiredStatus === "ERROR") {
         throw new Error(`Pod ${podId} entered terminal state: ${pod.desiredStatus}`);
       } else {
